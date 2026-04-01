@@ -1,0 +1,184 @@
+/*
+ * Copyright 2022 NXP
+ * NXP confidential.
+ * This software is owned or controlled by NXP and may only be used strictly
+ * in accordance with the applicable license terms.  By expressly accepting
+ * such terms or by downloading, installing, activating and/or otherwise using
+ * the software, you are agreeing that you have read, and that you agree to
+ * comply with and are bound by, such license terms.  If you do not agree to
+ * be bound by the applicable license terms, then you may not retain, install,
+ * activate or otherwise use the software.
+ */
+#ifdef __USE_CMSIS
+#include "LPC17xx.h"
+#include <stdio.h>
+#include <math.h>
+#endif
+
+//Include para cada periférico.
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_adc.h"
+#include "lpc17xx_dac.h"
+#include "lpc17xx_gpdma.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_timer.h"
+
+#include <cr_section_macros.h>
+
+//Macros
+#define pinADC		 	(1<<23) //AD0.0 - P0.23
+#define PORT0			0
+#define PORT1			1
+#define pinDAC			(1<<26) //AOUT - P0.26
+#define pinMAT			(1<<28) //P1.28 MAT0.0
+#define OUTPUT			1
+#define INPUT			0
+#define sR_Hz			10			//Muestreo en Hz
+#define ADC_BUFFER		0x2007C000
+#define ADC_BUFFER_SIZE	100
+#define carga_timer		500			//500ms o 0.5s de carga
+
+//Variables globales
+
+volatile uint32_t *bufferADC 		= (volatile uint32_t *)ADC_BUFFER;
+volatile uint32_t raw_data			= 0;
+volatile float processed_data		= 0;
+volatile float tension_dac			= 0;
+volatile uint32_t valor_dac			= 0;
+static float		A = 0.001129148;
+static float		B = 0.000234125;
+static float 		C = 0.0000000876741;
+static float		R = 10000;
+
+//Definición de funciones
+void configGPIO();
+void configADC();
+void configGPDMA();
+void configDAC();
+void process_and_update();
+void configTMR();
+
+//Función main
+int main(void)
+{
+    while(1)
+    {}
+    return 0 ;
+}
+
+void configGPIO()
+{
+	PINSEL_CFG_Type		pin_adc;
+
+	pin_adc.portNum			= PINSEL_PORT_0;
+	pin_adc.pinNum			= PINSEL_PIN_23;
+	pin_adc.funcNum			= PINSEL_FUNC_1;
+	pin_adc.pinMode			= PINSEL_TRISTATE;
+	pin_adc.openDrain		= PINSEL_OD_NORMAL;
+
+	PINSEL_ConfigPin(&pin_adc);
+
+	PINSEL_CFG_Type		pin_dac;
+
+	pin_dac.portNum			= PINSEL_PORT_0;
+	pin_dac.pinNum			= PINSEL_PIN_26;
+	pin_dac.funcNum			= PINSEL_FUNC_2;
+	pin_dac.pinMode			= PINSEL_TRISTATE;
+	pin_dac.openDrain		= PINSEL_OD_NORMAL;
+
+	PINSEL_ConfigPin(&pin_dac);
+
+	PINSEL_CFG_Type		pin_mat;
+	pin_mat.portNum			= PINSEL_PORT_1;
+	pin_mat.pinNum			= PINSEL_PIN_28;
+	pin_mat.funcNum			= PINSEL_FUNC_3;
+	pin_mat.pinMode			= PINSEL_TRISTATE;
+	pin_mat.openDrain		= PINSEL_OD_NORMAL;
+
+	PINSEL_ConfigPin(&pin_mat);
+}
+
+void configADC()
+{
+	ADC_Init(sR_Hz);
+	ADC_BurstCmd(ENABLE);
+	ADC_StartCmd(ADC_START_CONTINUOUS);
+	ADC_ChannelCmd(ADC_CHANNEL_0, ENABLE);
+	ADC_IntConfig(ADC_ADINTEN0, DISABLE);
+}
+
+void configGPDMA()
+{
+	GPDMA_Init();
+	NVIC_DisableIRQ(DMA_IRQn);
+	GPDMA_LLI_Type 			adc_to_dma;
+	adc_to_dma.SrcAddr			= (uint32_t) &(LPC_ADC->ADDR0);
+	adc_to_dma.DstAddr			= (uint32_t) bufferADC;
+	adc_to_dma.NextLLI			= (uint32_t)&adc_to_dma;
+	adc_to_dma.Control			= ((ADC_BUFFER_SIZE<<0)|(2<<18)|(2<<21)|(1<<27))&~(1<<26);
+
+	GPDMA_Channel_CFG_Type	cfg_channel;
+	cfg_channel.ChannelNum		= 0;
+	cfg_channel.SrcConn			= GPDMA_CONN_ADC;
+	cfg_channel.DstConn			= 0;
+	cfg_channel.SrcMemAddr		= 0;
+	cfg_channel.DstMemAddr		= (uint32_t)bufferADC;
+	cfg_channel.TransferType	= GPDMA_TRANSFERTYPE_P2M;
+	cfg_channel.TransferSize	= ADC_BUFFER_SIZE;
+	cfg_channel.TransferWidth	= 0;
+	cfg_channel.DMALLI 			= (uint32_t)&adc_to_dma;
+
+	GPDMA_Setup(&cfg_channel);
+	GPDMA_ChannelCmd(0, ENABLE);
+}
+
+void configDAC()
+{
+	DAC_Init();
+}
+
+void configTMR()
+{
+	TIM_TIMERCFG_Type		tmr_cfg;
+	tmr_cfg.prescaleOption			= TIM_USVAL;
+	tmr_cfg.prescaleValue			= 1000; 		//1000uS por incremento, es decir, 1mS.
+
+	TIM_MATCHCFG_Type		mat_cfg;
+	mat_cfg.matchChannel			= TIM_MATCH_CHANNEL_0;
+	mat_cfg.intOnMatch				= ENABLE;
+	mat_cfg.stopOnMatch				= DISABLE;
+	mat_cfg.resetOnMatch			= ENABLE;
+	mat_cfg.extMatchOutputType		= TIM_NOTHING;
+	mat_cfg.matchValue				= carga_timer;
+
+	TIM_Init(LPC_TIM0, TIM_TIMER_MODE, &tmr_cfg);
+	TIM_ConfigMatch(LPC_TIM0, &mat_cfg);
+	TIM_Cmd(LPC_TIM0, ENABLE);
+	NVIC_EnableIRQ(TIMER0_IRQn);
+}
+
+void TIMER0_IRQHandler()
+{
+	if(TIM_GetIntStatus(LPC_TIM0, TIM_MR0_INT))
+	{
+		process_and_update();
+		TIM_ClearIntPending(LPC_TIM0, TIM_MR0_INT);
+	}
+}
+
+void process_and_update()
+{
+	for(int i = 0; i<ADC_BUFFER_SIZE ; i++)
+	{
+		raw_data += ((bufferADC[i]>>4)&0xFFF);
+	}
+	processed_data = ((raw_data/ADC_BUFFER_SIZE));
+	processed_data = (1/(A+(B*log(R))+(C*pow(log(R),3)))); //Temperatura en grados Celsius
+	if(processed_data < 20)
+		processed_data = 20;
+	if(processed_data > 50)
+		processed_data = 50;
+	tension_dac = (((processed_data - 20)*3.3)/30); //Rango entre 20 y 50 ºC. Cada V representa 9.1ºC.
+	valor_dac	= (uint_32)((tension_dac / 3.3)*1023); //Escalado de tensión para 10bits.
+	DAC_UpdateValue(valor_dac); //El valor ya se desplaza <<6 por la función.
+}
